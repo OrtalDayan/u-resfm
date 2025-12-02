@@ -1,0 +1,421 @@
+import csv
+import sys
+# sys.path.append('/home/projects/ronen/fadi/myProjects/outliersRemoval3D/code/datasets')
+# sys.path.append('/home/projects/ronen/fadi/myProjects/outliersRemoval3D/code/utils')
+# sys.path.append('/home/projects/ronen/fadi/myProjects/outliersRemoval3D/code')
+# print(sys.path)
+import cv2  # Do not remove
+import torch
+import os
+import sys
+import warnings 
+from utils.dataset_utils import get_M_valid_points
+from utils.Phases import Phases
+from utils.path_utils import path_to_outliers
+from utils import geo_utils, general_utils, dataset_utils, path_utils, plot_utils
+import scipy.io as sio
+import numpy as np
+import os.path
+import networkx as nx
+from tqdm import tqdm
+import copy
+
+import torch
+import numpy as np
+import re
+
+
+# from utils.path_utils import path_to_outliers, write_results
+from utils.general_utils import write_results
+
+
+
+def detect_outliers_statistical(reprojection_errors, weight_method='mad', alpha=1.0):
+    """
+    Detect outliers based on reprojection error statistics
+    
+    Args:
+        reprojection_errors: Per-point reprojection errors
+        method: 'mad' (Median Absolute Deviation) or 'std' (Standard Deviation)
+        alpha: Threshold multiplier
+    
+    Returns:
+        outlier_mask: Binary mask indicating outliers
+    """
+    
+    if weight_method == 'mad':
+        median = torch.median(reprojection_errors)
+        mad = torch.median(torch.abs(reprojection_errors - median))
+        threshold = median + alpha * 1.4826 * mad  # 1.4826 converts MAD to std
+        
+    elif weight_method == 'std':
+        mean = torch.mean(reprojection_errors)
+        std = torch.std(reprojection_errors)
+        threshold = mean + alpha * std
+    
+    # outlier_mask = reprojection_errors > threshold
+    outlier_mask = (reprojection_errors > threshold).to(torch.float32)
+
+    return outlier_mask
+
+def compute_huber_weights(reprojection_errors, threshold=1.0):
+    """
+    Huber-style robust weighting for probabilistic self-supervision
+    
+    Args:
+        reprojection_errors: Per-point reprojection errors
+        threshold: Huber threshold parameter (typically 1.0 pixel)
+    
+    Returns:
+        weights: Huber weights for each point
+    """
+    weights = torch.ones_like(reprojection_errors)
+    mask = reprojection_errors > threshold
+    weights[mask] = threshold / reprojection_errors[mask]
+    return weights
+
+def get_raw_data(conf, scan, phase, stage=1):
+    """
+    Load raw data for SfM training or evaluation.
+
+    Returns:
+        M (torch.Tensor): 2D points matrix [2m, n]
+        Ns (torch.Tensor): Inverse calibration matrices [m, 3, 3]
+        Ps_gt (torch.Tensor): Ground-truth projection matrices [m, 3, 4]
+        outliers (torch.Tensor): Ground-truth outlier mask [m, n]
+        dict_info (dict): Metadata (e.g., outliers percent)
+        names_list (list): List of image names
+        M_original (torch.Tensor): Original points matrix (before filtering)
+    """
+
+    # === Setup paths and parameters ===
+    dataset_name = conf.get_string('dataset.dataset', default="megadepth")
+    dataset_path = os.path.join(path_utils.path_to_datasets(dataset_name), f'{scan}.npz')
+    
+    output_mode = conf.get_int('train.output_mode', default=-1)
+    use_gt = conf.get_bool('dataset.use_gt')
+    remove_outliers_gt = conf.get_bool('dataset.remove_outliers_gt', default=False)
+    remove_outliers_pred = False
+    outliers_threshold = conf.get_float("test.outliers_threshold", default=0.6)
+    if scan is None:
+        scan = conf.get_string('dataset.scan')
+
+    print(f"Used Dataset: {dataset_name}")
+    print(f"Loading from: {dataset_path}")
+    dataset = np.load(dataset_path, allow_pickle=True)
+ 
+   
+
+    # === Extract raw data ===
+    M_np = dataset['M']
+    Ps_gt_np = dataset['Ps_gt']
+    Ns_np = dataset['Ns']
+    names_list = dataset['namesList']
+    outliers_np = dataset.get('outliers2', np.zeros((M_np.shape[0] // 2, M_np.shape[1])))
+
+    # === Initialize info dictionary ===
+    dict_info = {
+        'pointsNum': M_np.shape[1],
+        'camsNum': M_np.shape[0] // 2,
+        'outliersPercent': float("%.4f" % dataset.get('outlier_pct', 0.0)),
+        'outliers_pred': torch.zeros_like(torch.from_numpy(outliers_np).float())
+    }
+
+    # === Convert to torch tensors ===
+    M = torch.from_numpy(M_np).float()
+    M_original = M.clone()
+    Ps_gt = torch.from_numpy(Ps_gt_np).float()
+    Ns = torch.from_numpy(Ns_np).float()
+    outliers = torch.from_numpy(outliers_np).float()
+    outliers_mask = outliers.clone()
+    
+
+    # === Fine-tuning: Load predicted outliers ===
+    if phase is Phases.FINE_TUNE and output_mode == 3:
+        print(f"Fine-tuning phase: loading predicted outliers for scan {scan}")
+        print("Loading outliers from:", path_to_outliers(conf, Phases.TEST, epoch=None, scan=scan))
+        outliers_mask_np = np.load(path_to_outliers(conf, Phases.TEST, epoch=None, scan=scan) + ".npz")['outliers_pred']
+        outliers_mask = torch.from_numpy(outliers_mask_np > outliers_threshold)
+        remove_outliers_pred = True
+
+
+    # === Remove outliers ===
+    if remove_outliers_gt or remove_outliers_pred:
+        outliers_mask = outliers_mask > 0  # ensure boolean mask
+
+        # Convert shape [2m, n] → [n, m, 2] → [m, n, 2]
+        M = M.transpose(0, 1).reshape(-1, M.shape[0] // 2, 2).transpose(0, 1)
+        M[outliers_mask] = 0
+        # Back to [2m, n]
+        M = M.transpose(0, 1).reshape(-1, M.shape[0] * 2).transpose(0, 1)
+
+    # === Keep only largest connected component if fine-tuning with outputMode == 3 ===
+    if phase is Phases.FINE_TUNE and output_mode == 3:
+        _, valid_cam_indices = dataset_utils.check_if_M_connected(M, thr=1, return_largest_component=True)
+        double_cam_indices = [j for i in [[idx * 2, idx * 2 + 1] for idx in valid_cam_indices] for j in i]
+
+        Ns = Ns[valid_cam_indices]
+        Ps_gt = Ps_gt[valid_cam_indices]
+        outliers = outliers[valid_cam_indices]
+        names_list = names_list[valid_cam_indices]
+        M = M[double_cam_indices]
+        M_original = M_original[double_cam_indices]
+
+    if stage == 2: 
+        # Try to get the path from config, but make it optional
+        # For stage 2, weights are loaded manually in the training script
+        
+        try:
+            weight_method = conf.get_string('postprocessing.weight_method')
+            print(f"Got weight_method from postprocessing: {weight_method}")
+        except Exception as e:
+            weight_method = 'global'  # Default fallback
+            print(f"Failed to get weight_method: {e}")
+        
+        
+        alpha = conf.get_float('postprocessing.alpha')
+        
+        print(conf.get_string('results_path'))
+        
+        
+        # proj_err_path = os.path.join(
+        # re.sub(r'/2_stage/(global|track_and_global|(?:mad|std|huber)_alpha_\d+_\d+)/', '/1_stage/', 
+        #         conf.get_string('results_path')),
+        #     'reprojection_errors.npy'
+        # )
+
+        proj_err_path = os.path.join(
+        re.sub(r'/2_stage/ESFMLoss_weighted_by_rep_err/(global|track_and_global|(?:mad|std|huber)(?:_alpha_\d+_\d+)?)/', 
+                '/1_stage/ESFMLoss/', 
+                conf.get_string('results_path')
+            ),
+            'reprojection_errors.npy'
+        )
+
+        print('proj_err_path', proj_err_path)
+        try:
+         
+            reprojection_errors = np.load(proj_err_path, allow_pickle=True)
+            reprojection_errors = torch.from_numpy(reprojection_errors).float()
+        except:
+            # Config key not found - will be loaded manually later (e.g., in stage 2)
+            print(f"proj_err_path not found: {proj_err_path}")
+
+   
+        print('weight_method', weight_method)  
+        print('alpha', alpha)  
+        if weight_method == 'huber':
+            rep_error_weights = compute_huber_weights(reprojection_errors, threshold=alpha)
+        elif weight_method == 'mad' or weight_method == 'std':
+            rep_error_weights = detect_outliers_statistical(reprojection_errors, weight_method=weight_method, alpha=alpha)
+        
+        try:
+            proj_err_weight_path = conf.get_string('results_path')
+            
+            proj_err_dir = os.path.dirname(proj_err_weight_path)
+            if not os.path.exists(proj_err_dir):
+                os.makedirs(proj_err_dir)
+                print(f"Created directory: {proj_err_dir}")
+                
+            # Save the reprojection error weights
+            write_results(conf, rep_error_weights, file_name="reprojection_errror_weights", append=False)
+
+            print(f"Successfully saved projection error weights to: {proj_err_weight_path}")
+        
+        except Exception as e:
+            print(f"ERROR: Failed to save reprojection errors: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return M, Ns, Ps_gt, outliers, dict_info, names_list, M_original, rep_error_weights
+    else:
+        return M, Ns, Ps_gt, outliers, dict_info, names_list, M_original, None 
+
+
+
+
+# def get_raw_data(conf, scan, phase, with_proj_err=False):
+#     """
+#     Load raw data for SfM training or evaluation.
+
+#     Returns:
+#         M (torch.Tensor): 2D points matrix [2m, n]
+#         Ns (torch.Tensor): Inverse calibration matrices [m, 3, 3]
+#         Ps_gt (torch.Tensor): Ground-truth projection matrices [m, 3, 4]
+#         outliers (torch.Tensor): Ground-truth outlier mask [m, n]
+#         dict_info (dict): Metadata (e.g., outliers percent)
+#         names_list (list): List of image names
+#         M_original (torch.Tensor): Original points matrix (before filtering)
+#     """
+
+#     # === Setup paths and parameters ===
+#     dataset_name = conf.get_string('dataset.dataset', default="megadepth")
+#     dataset_path = os.path.join(path_utils.path_to_datasets(dataset_name), f'{scan}.npz')
+    
+#     output_mode = conf.get_int('train.output_mode', default=-1)
+#     use_gt = conf.get_bool('dataset.use_gt')
+#     remove_outliers_gt = conf.get_bool('dataset.remove_outliers_gt', default=False)
+#     remove_outliers_pred = False
+#     outliers_threshold = conf.get_float("test.outliers_threshold", default=0.6)
+#     if scan is None:
+#         scan = conf.get_string('dataset.scan')
+
+#     print(f"Used Dataset: {dataset_name}")
+#     print(f"Loading from: {dataset_path}")
+#     dataset = np.load(dataset_path, allow_pickle=True)
+ 
+   
+
+#     # === Extract raw data ===
+#     M_np = dataset['M']
+#     Ps_gt_np = dataset['Ps_gt']
+#     Ns_np = dataset['Ns']
+#     names_list = dataset['namesList']
+#     outliers_np = dataset.get('outliers2', np.zeros((M_np.shape[0] // 2, M_np.shape[1])))
+
+#     # === Initialize info dictionary ===
+#     dict_info = {
+#         'pointsNum': M_np.shape[1],
+#         'camsNum': M_np.shape[0] // 2,
+#         'outliersPercent': float("%.4f" % dataset.get('outlier_pct', 0.0)),
+#         'outliers_pred': torch.zeros_like(torch.from_numpy(outliers_np).float())
+#     }
+
+#     # === Convert to torch tensors ===
+#     M = torch.from_numpy(M_np).float()
+#     M_original = M.clone()
+#     Ps_gt = torch.from_numpy(Ps_gt_np).float()
+#     Ns = torch.from_numpy(Ns_np).float()
+#     outliers = torch.from_numpy(outliers_np).float()
+#     outliers_mask = outliers.clone()
+    
+
+#     # === Fine-tuning: Load predicted outliers ===
+#     if phase is Phases.FINE_TUNE and output_mode == 3:
+#         print(f"Fine-tuning phase: loading predicted outliers for scan {scan}")
+#         print("Loading outliers from:", path_to_outliers(conf, Phases.TEST, epoch=None, scan=scan))
+#         outliers_mask_np = np.load(path_to_outliers(conf, Phases.TEST, epoch=None, scan=scan) + ".npz")['outliers_pred']
+#         outliers_mask = torch.from_numpy(outliers_mask_np > outliers_threshold)
+#         remove_outliers_pred = True
+
+
+#     # === Remove outliers ===
+#     if remove_outliers_gt or remove_outliers_pred:
+#         outliers_mask = outliers_mask > 0  # ensure boolean mask
+
+#         # Convert shape [2m, n] → [n, m, 2] → [m, n, 2]
+#         M = M.transpose(0, 1).reshape(-1, M.shape[0] // 2, 2).transpose(0, 1)
+#         M[outliers_mask] = 0
+#         # Back to [2m, n]
+#         M = M.transpose(0, 1).reshape(-1, M.shape[0] * 2).transpose(0, 1)
+
+#     # === Keep only largest connected component if fine-tuning with outputMode == 3 ===
+#     if phase is Phases.FINE_TUNE and output_mode == 3:
+#         _, valid_cam_indices = dataset_utils.check_if_M_connected(M, thr=1, return_largest_component=True)
+#         double_cam_indices = [j for i in [[idx * 2, idx * 2 + 1] for idx in valid_cam_indices] for j in i]
+
+#         Ns = Ns[valid_cam_indices]
+#         Ps_gt = Ps_gt[valid_cam_indices]
+#         outliers = outliers[valid_cam_indices]
+#         names_list = names_list[valid_cam_indices]
+#         M = M[double_cam_indices]
+#         M_original = M_original[double_cam_indices]
+
+#     if with_proj_err: 
+#         # Try to get the path from config, but make it optional
+#         # For stage 2, weights are loaded manually in the training script
+#         try:
+#             proj_err_path = os.path.join(conf.get_string('results_path'), 'reprojection_errors.npy').replace('2_', '1_')
+#             #if proj_err_path and os.path.exists(proj_err_path):
+#             reprojection_errors = np.load(proj_err_path, allow_pickle=True)
+#             reprojection_errors = torch.from_numpy(reprojection_erros).float()
+#             # else:
+#             #     # Path not found or empty - will be loaded manually later
+#             #     proj_err_weight = None
+#         except:
+#             # Config key not found - will be loaded manually later (e.g., in stage 2)
+#             # proj_err_weight = None
+#             print(f"proj_err_path not found: {os.path.join(conf.get_string('results_path'), 'reprojection_errors.npy').replace('2_', '1_')}")
+
+         
+#         # Get weight_method from postprocessing section
+#         try:
+#             weight_method = conf.get_string('postprocessing.weight_method')
+#             print(f"Got weight_method from postprocessing: {weight_method}")
+#         except Exception as e:
+#             weight_method = 'global'  # Default fallback
+#             print(f"Failed to get weight_method: {e}, using default: {weight_method}")
+#         print('weight_method', weight_method)    
+#         if weight_method == 'global':
+#             # log_errors = np.log(rep_errors_like_M + 1)
+#             # mean, std = np.nanmean(log_errors), np.nanstd(log_errors)
+#             # normalized = (log_errors - mean) / std
+#             # rep_error_weights = 1 / (1 + np.exp(-normalized))
+#             # Usage:
+#             rep_error_weights = compute_log_sigmoid_weights(reprojection_errors)
+#         elif weight_method == 'track_and_global': 
+
+#             rep_error_weights, track_factors = track_normalized_weighting(reprojection_errors) 
+#         # elif weight_method == 'remove-outliers': 
+#         #     rep_errors_like_M[rep_errors_like_M > 1] = np.nan
+#         #     rep_error_weights = rep_errors_like_M
+#         try:
+#             proj_err_weight_path = conf.get_string('results_path')
+            
+#             proj_err_dir = os.path.dirname(proj_err_weight_path)
+#             if not os.path.exists(proj_err_dir):
+#                 os.makedirs(proj_err_dir)
+#                 print(f"Created directory: {proj_err_dir}")
+                
+#             # Save the reprojection error weights
+#             write_results(conf, rep_error_weights, file_name="reprojection_errror_weights", append=False)
+
+#             print(f"Successfully saved projection error weights to: {proj_err_weight_path}")
+        
+#         except Exception as e:
+#             print(f"ERROR: Failed to save reprojection errors: {e}")
+#             import traceback
+#             traceback.print_exc()
+        
+#         return M, Ns, Ps_gt, outliers, dict_info, names_list, M_original, rep_error_weights
+#     else:
+#         return M, Ns, Ps_gt, outliers, dict_info, names_list, M_original
+
+
+
+
+def test_Ps_M(Ps, M, Ns):
+    global_rep_err = geo_utils.calc_global_reprojection_error(Ps.numpy(), M.numpy(), Ns.numpy())
+    print("Reprojection Error: Mean = {}, Max = {}".format(np.nanmean(global_rep_err), np.nanmax(global_rep_err)))
+    return np.nanmean(global_rep_err), np.nanmax(global_rep_err)
+
+
+
+
+def test_euclidean_dataset(scan):
+    dataset_path_format = os.path.join(path_utils.path_to_datasets(), 'Euclidean', '{}.npz')
+
+    # Get raw data
+    dataset = np.load(dataset_path_format.format(scan))
+
+    # Get bifocal tensors and 2D points
+    M = dataset['M']
+    Ps_gt = dataset['Ps_gt']
+    Ns = dataset['Ns']
+
+    M_gt = torch.from_numpy(dataset_utils.correct_matches_global(M, Ps_gt, Ns)).float()
+
+    M = torch.from_numpy(M).float()
+    Ps_gt = torch.from_numpy(Ps_gt).float()
+    Ns = torch.from_numpy(Ns).float()
+
+    print("Test Ps and M")
+    test_Ps_M(Ps_gt, M, Ns)
+
+    print("Test Ps and M_gt")
+    test_Ps_M(Ps_gt, M_gt, Ns)
+
+
+
+
+pass

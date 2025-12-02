@@ -1,0 +1,53 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# PyTorch model files
+*.pth
+*.pt
+*.ckpt
+*.pth.tar
+
+# Datasets
+data/
+megadepth/
+code/datasets/megadepth/
+*.csv
+*.h5
+*.hdf5
+
+# Training outputs
+code/lsf_output/
+code/results/
+code/confs/
+
+# Large files
+*.zip
+*.tars
+*.tar.gz
+*.pkl
+*.pickle
+*.npz
+*.npy
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
